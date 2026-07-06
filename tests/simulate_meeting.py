@@ -1,14 +1,14 @@
 """Simulate a live meeting by feeding an existing recording chunk-by-chunk.
 
-Usage: python simulate_meeting.py <video_path> [--port 5200] [--chunk-seconds 10]
+Uses dual-window transcription:
+- 5s chunks for fast updates
+- Every 30s of accumulated chunks triggers a refined pass
 
-This starts the web server AND feeds audio/screenshots at real-time pace,
-so you can open the browser and watch the monitor update live.
+Usage: python simulate_meeting.py <video_path> [--speed 5]
 """
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import tempfile
 import threading
@@ -23,52 +23,51 @@ from genie_live.monitor import MeetingMonitor
 from genie_live.server import create_app
 
 
-def simulate(video_path: str, port: int = 5200, chunk_seconds: int = 10,
-             text_model: str = None, speed: float = 1.0):
-    """Run meeting simulation."""
+def simulate(video_path: str, port: int = 5200, text_model: str = None,
+             whisper_model: str = "medium", speed: float = 5.0,
+             fast_window: int = 5, slow_window: int = 30):
 
-    # Get video duration
     dur = subprocess.check_output([
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "csv=p=0", video_path
     ]).decode().strip()
     duration = float(dur)
-    num_chunks = int(duration / chunk_seconds) + 1
+    num_chunks = int(duration / fast_window) + 1
 
-    print("Simulating %.0f-second meeting in %d chunks (%.1fx speed)" % (
-        duration, num_chunks, speed))
+    print("Simulating %.0fs meeting: %d x %ds chunks (%.1fx speed)" % (
+        duration, num_chunks, fast_window, speed))
+    print("Dual window: %ds fast + %ds refined" % (fast_window, slow_window))
 
-    # Create app
     app, socketio = create_app(text_model=text_model)
 
-    # Access the monitor from the app
-    # We'll feed data directly instead of using capture devices
-    monitor = MeetingMonitor(text_model=text_model)
+    monitor = MeetingMonitor(
+        text_model=text_model,
+        whisper_model=whisper_model,
+        fast_window=fast_window,
+        slow_window=slow_window,
+    )
 
     def on_update(state):
         socketio.emit("state_update", state)
     monitor.on_update(on_update)
 
-    # Override the /api/state endpoint to use our monitor
-    @app.route("/api/sim-state", methods=["GET"])
-    def sim_state():
+    @app.route("/api/state")
+    def override_state():
         from flask import jsonify
         return jsonify(monitor.get_state())
 
-    # Feed chunks in background
     def feed_chunks():
-        time.sleep(2)  # Wait for server to start
+        time.sleep(2)
         tmpdir = tempfile.mkdtemp()
 
         for i in range(num_chunks):
-            if i * chunk_seconds >= duration:
+            start_time = i * fast_window
+            if start_time >= duration:
                 break
 
-            start_time = i * chunk_seconds
-            chunk_dur = min(chunk_seconds, duration - start_time)
+            chunk_dur = min(fast_window, duration - start_time)
             chunk_path = "%s/chunk_%04d.wav" % (tmpdir, i)
 
-            # Extract audio chunk
             subprocess.run([
                 "ffmpeg", "-ss", str(start_time),
                 "-i", video_path,
@@ -77,44 +76,47 @@ def simulate(video_path: str, port: int = 5200, chunk_seconds: int = 10,
                 chunk_path, "-y"
             ], capture_output=True)
 
-            # Extract screenshot
-            frame_path = "%s/frame_%04d.png" % (tmpdir, i)
-            subprocess.run([
-                "ffmpeg", "-ss", str(start_time),
-                "-i", video_path,
-                "-vframes", "1", "-q:v", "2",
-                frame_path, "-y"
-            ], capture_output=True)
+            # Screenshot every 6th chunk (~30s)
+            if i % (slow_window // fast_window) == 0:
+                frame_path = "%s/frame_%04d.png" % (tmpdir, i)
+                subprocess.run([
+                    "ffmpeg", "-ss", str(start_time),
+                    "-i", video_path,
+                    "-vframes", "1", "-q:v", "2",
+                    frame_path, "-y"
+                ], capture_output=True)
+                if Path(frame_path).exists():
+                    monitor.add_screen_frame(frame_path, i, time.time())
 
-            print("[%02d:%02d] Feeding chunk %d/%d..." % (
-                int(start_time // 60), int(start_time % 60), i + 1, num_chunks))
+            t = "%02d:%02d" % (int(start_time // 60), int(start_time % 60))
+            state = monitor.get_state()
+            print("[%s] chunk %d/%d | fast:%d refined:%d total:%d" % (
+                t, i + 1, num_chunks,
+                state["fast_count"], state["refined_count"], state["transcript_count"]))
 
-            # Feed to monitor
-            monitor.add_transcript_chunk(chunk_path, i)
-            if Path(frame_path).exists():
-                monitor.add_screen_frame(frame_path, i, time.time())
+            monitor.add_audio_chunk(chunk_path, i, fast_window)
 
-            # Wait (simulated real-time, adjusted by speed)
-            time.sleep(chunk_seconds / speed)
+            time.sleep(fast_window / speed)
 
         print("\nSimulation complete!")
 
     feeder = threading.Thread(target=feed_chunks, daemon=True)
     feeder.start()
 
-    print("Monitor running at http://localhost:%d" % port)
-    print("Open browser to watch live updates.\n")
+    print("Monitor: http://localhost:%d\n" % port)
     socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simulate live meeting from recording")
-    parser.add_argument("video", help="Path to video file")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("video")
     parser.add_argument("--port", type=int, default=5200)
-    parser.add_argument("--chunk-seconds", type=int, default=10)
     parser.add_argument("--text-model", default=None)
-    parser.add_argument("--speed", type=float, default=5.0,
-                        help="Simulation speed multiplier (default: 5x)")
+    parser.add_argument("--whisper-model", default="medium")
+    parser.add_argument("--speed", type=float, default=5.0)
+    parser.add_argument("--fast-window", type=int, default=5)
+    parser.add_argument("--slow-window", type=int, default=30)
     args = parser.parse_args()
 
-    simulate(args.video, args.port, args.chunk_seconds, args.text_model, args.speed)
+    simulate(args.video, args.port, args.text_model, args.whisper_model,
+             args.speed, args.fast_window, args.slow_window)
