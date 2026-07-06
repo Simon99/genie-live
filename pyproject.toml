@@ -6,7 +6,6 @@ requires-python = ">=3.9"
 dependencies = [
     "genie-core @ git+https://github.com/Simon99/genie-core.git",
     "flask>=3.0",
-    "flask-cors>=4.0",
     "flask-socketio>=5.3",
 ]
 
@@ -15,4 +14,4 @@ genie-live = "genie_live.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
