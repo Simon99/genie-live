@@ -113,6 +113,15 @@ def create_app(
         monitor.set_vocabulary(data.get("vocabulary", []))
         return jsonify({"status": "updated"})
 
+    @app.route("/api/vocabulary/blacklist", methods=["POST"])
+    def blacklist_vocabulary():
+        data = request.get_json(silent=True) or {}
+        term = (data.get("term") or "").strip()
+        if not term:
+            return jsonify({"error": "term required"}), 400
+        monitor.blacklist_auto_term(term)
+        return jsonify({"status": "updated"})
+
     @app.route("/api/gate", methods=["POST"])
     def update_gate():
         data = request.get_json(silent=True) or {}

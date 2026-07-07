@@ -234,7 +234,9 @@
 
     VocabPanel.prototype.render = function (props) {
       var self = this;
-      var vocab = (props.serverState || {}).vocabulary || [];
+      var s = props.serverState || {};
+      var vocab = s.vocabulary || [];
+      var auto = s.vocabulary_auto || [];
 
       function add() {
         var t = self.state.draft.trim();
@@ -257,14 +259,23 @@
               onKeyDown=${function (e) { if (e.key === "Enter") add(); }} />
             <button class="secondary" onClick=${add}>新增</button>
           </div>
-          ${vocab.length === 0
-            ? html`<div class="muted">加入領域詞彙可提高轉寫命中率（即時生效）。</div>`
+          ${vocab.length === 0 && auto.length === 0
+            ? html`<div class="muted">加入領域詞彙可提高轉寫命中率（即時生效）；會議中系統也會自動學習新術語。</div>`
             : html`<div class="vocab-chips">
                 ${vocab.map(function (t, i) {
                   return html`
-                    <span class="chip" key=${i}>${t}
+                    <span class="chip" key=${"u" + i}>${t}
                       <button class="chip-x"
                         onClick=${function () { remove(t); }}>×</button>
+                    </span>`;
+                })}
+                ${auto.map(function (t, i) {
+                  return html`
+                    <span class="chip chip-auto" key=${"a" + i}
+                      title="會議中自動學習的術語；× 移除並不再自動加回">
+                      ${t}
+                      <button class="chip-x"
+                        onClick=${function () { props.onBlacklist(t); }}>×</button>
                     </span>`;
                 })}
               </div>`}
@@ -470,6 +481,11 @@
                 onSetVocabulary=${function (list) {
                   self.action(function () {
                     return postJSON("/api/vocabulary", { vocabulary: list });
+                  });
+                }}
+                onBlacklist=${function (term) {
+                  self.action(function () {
+                    return postJSON("/api/vocabulary/blacklist", { term: term });
                   });
                 }} />
               <${GatePanel}

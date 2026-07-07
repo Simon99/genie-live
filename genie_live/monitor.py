@@ -154,9 +154,11 @@ class MeetingMonitor:
         # initial_prompt; "錯詞=正詞" entries additionally force a text
         # replacement after transcription (for stubborn homophones).
         # Persisted to vocab_path so it survives restarts.
-        self._vocab_raw = []              # entries as the user typed them
-        self._vocab_terms = []            # plain hotword terms
+        self._vocab_raw = []              # user entries as typed
+        self._vocab_terms = []            # user hotword terms
         self._corrections = {}            # wrong -> right
+        self._vocab_auto = []             # terms auto-discovered mid-meeting
+        self._vocab_blacklist = set()     # user-rejected auto terms (session)
         self._vocab_path = Path(
             vocab_path or Path.home() / ".genie" / "live_vocabulary.json")
         self._load_vocabulary()
@@ -298,19 +300,15 @@ class MeetingMonitor:
                 self.gate_manual_db = max(-96.0, min(0.0, float(threshold_db)))
         self._notify_update()
 
-    def set_vocabulary(self, entries: list):
-        """Update the ASR hotword list from the UI (hot, no restart).
-
-        Plain entries become whisper initial_prompt terms; entries written
-        as ``錯詞=正詞`` also force a post-transcription replacement.
-        The list is persisted to ``vocab_path`` and reloaded on startup.
-        """
-        terms, corrections, raw = [], {}, []
+    @staticmethod
+    def _parse_vocab_entries(entries: list):
+        """Split raw entries into (kept_raw, prompt_terms, corrections)."""
+        terms, corrections, kept = [], {}, []
         for e in entries or []:
             e = str(e).strip()
             if not e:
                 continue
-            raw.append(e)
+            kept.append(e)
             if "=" in e:
                 wrong, _, right = e.partition("=")
                 wrong, right = wrong.strip(), right.strip()
@@ -319,55 +317,112 @@ class MeetingMonitor:
                     terms.append(right)
                 continue
             terms.append(e)
+        return kept, terms, corrections
+
+    def set_vocabulary(self, entries: list):
+        """Update the user ASR hotword list from the UI (hot, no restart).
+
+        Plain entries become whisper initial_prompt terms; entries written
+        as ``錯詞=正詞`` also force a post-transcription replacement.
+        User entries are persisted to ``vocab_path`` and reloaded on
+        startup; auto-discovered terms live alongside them (see
+        ``_merge_auto_terms``).
+        """
+        raw, terms, corrections = self._parse_vocab_entries(entries)
         with self._lock:
             self._vocab_raw = raw
             self._vocab_terms = terms
             self._corrections = corrections
-        self._save_vocabulary(raw)
+            # A term explicitly added by the user leaves the auto pool.
+            self._vocab_auto = [t for t in self._vocab_auto if t not in terms]
+        self._save_vocabulary()
         self._notify_update()
 
+    def blacklist_auto_term(self, term: str):
+        """Remove an auto-discovered term and stop re-learning it."""
+        term = str(term).strip()
+        with self._lock:
+            self._vocab_auto = [t for t in self._vocab_auto if t != term]
+            self._vocab_blacklist.add(term)
+        self._save_vocabulary()
+        self._notify_update()
+
+    def _merge_auto_terms(self, candidates: list):
+        """Fold LLM-extracted terms into the auto vocabulary (hold no lock).
+
+        Auto terms extend the hotword prompt for the rest of the meeting:
+        a proper noun mentioned early biases transcription of its later
+        mentions. Capped FIFO so a long meeting can't grow the prompt
+        unboundedly; user entries and blacklisted terms are never touched.
+        """
+        cleaned = []
+        for t in candidates or []:
+            t = str(t).strip().strip("、,;。 ")
+            if not (2 <= len(t) <= 30) or "\n" in t or t.isdigit():
+                continue
+            cleaned.append(t)
+        if not cleaned:
+            return
+        changed = False
+        with self._lock:
+            known = set(self._vocab_terms) | set(self._vocab_auto) | self._vocab_blacklist
+            for t in cleaned:
+                if t in known:
+                    continue
+                self._vocab_auto.append(t)
+                known.add(t)
+                changed = True
+            while len(self._vocab_auto) > self.AUTO_VOCAB_MAX:
+                dropped = self._vocab_auto.pop(0)
+                logger.info("auto vocab full, dropping oldest term %r", dropped)
+                changed = True
+        if changed:
+            self._save_vocabulary()
+            self._notify_update()
+
     def _load_vocabulary(self):
-        """Load persisted vocabulary at startup (missing file is fine)."""
+        """Load persisted vocabulary at startup (missing file is fine).
+
+        Accepts both the old format (plain list = user entries) and the
+        current ``{"user": [...], "auto": [...]}`` format.
+        """
         try:
-            if self._vocab_path.exists():
-                raw = json.loads(self._vocab_path.read_text(encoding="utf-8"))
-                if isinstance(raw, list) and raw:
-                    # Re-run the parse without re-saving.
-                    terms, corrections, kept = [], {}, []
-                    for e in raw:
-                        e = str(e).strip()
-                        if not e:
-                            continue
-                        kept.append(e)
-                        if "=" in e:
-                            wrong, _, right = e.partition("=")
-                            wrong, right = wrong.strip(), right.strip()
-                            if wrong and right:
-                                corrections[wrong] = right
-                                terms.append(right)
-                            continue
-                        terms.append(e)
-                    self._vocab_raw = kept
-                    self._vocab_terms = terms
-                    self._corrections = corrections
-                    logger.info("loaded %d vocabulary entries from %s",
-                                len(kept), self._vocab_path)
+            if not self._vocab_path.exists():
+                return
+            data = json.loads(self._vocab_path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                user, auto = data, []
+            elif isinstance(data, dict):
+                user, auto = data.get("user", []), data.get("auto", [])
+            else:
+                return
+            kept, terms, corrections = self._parse_vocab_entries(user)
+            self._vocab_raw = kept
+            self._vocab_terms = terms
+            self._corrections = corrections
+            self._vocab_auto = [str(t).strip() for t in auto if str(t).strip()]
+            logger.info("loaded %d user + %d auto vocabulary entries from %s",
+                        len(kept), len(self._vocab_auto), self._vocab_path)
         except Exception:
             logger.exception("failed to load vocabulary from %s", self._vocab_path)
 
-    def _save_vocabulary(self, raw: list):
+    def _save_vocabulary(self):
         try:
+            with self._lock:
+                payload = {"user": list(self._vocab_raw),
+                           "auto": list(self._vocab_auto)}
             self._vocab_path.parent.mkdir(parents=True, exist_ok=True)
             self._vocab_path.write_text(
-                json.dumps(raw, ensure_ascii=False, indent=1), encoding="utf-8")
+                json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception:
             logger.exception("failed to save vocabulary to %s", self._vocab_path)
 
     def _initial_prompt(self) -> str:
         """Hotword prompt for whisper, or None (hold self._lock)."""
-        if not self._vocab_terms:
+        terms = self._vocab_terms + self._vocab_auto
+        if not terms:
             return None
-        return "會議詞彙：" + "、".join(self._vocab_terms)
+        return "會議詞彙：" + "、".join(terms)
 
     def _apply_corrections(self, segments: list) -> list:
         with self._lock:
@@ -424,6 +479,7 @@ class MeetingMonitor:
                 "questions": self._get_question_status(),
                 "session_timeline": list(self._session_timeline),
                 "vocabulary": list(self._vocab_raw),
+                "vocabulary_auto": list(self._vocab_auto),
                 "audio_gate": {
                     "mode": self.gate_mode,
                     "threshold_db": threshold,
@@ -628,6 +684,8 @@ class MeetingMonitor:
         merged.sort(key=lambda s: s["start"])
         self._merged_segments = merged
 
+    AUTO_VOCAB_MAX = 30
+
     ANALYSIS_STYLE = (
         "所有描述用繁體中文；逐字稿中已是英文的技術術語、產品名、API 名"
         "保留英文原文。嚴禁把中文詞彙自行翻譯成英文（實測失誤案例："
@@ -647,11 +705,18 @@ class MeetingMonitor:
             for s in recent
         )
 
+        with self._lock:
+            known_terms = self._vocab_terms + self._vocab_auto
+
         prompt = (
             "You are monitoring a live meeting. Recent transcript:\n%s\n\n"
             "Provide JSON: {\"current_topic\": \"...\", \"status\": \"...\", "
-            "\"key_points\": [...], \"disputes\": [{\"topic\": \"...\", \"positions\": [...]}]"
-        ) % transcript_text
+            "\"key_points\": [...], \"disputes\": [{\"topic\": \"...\", \"positions\": [...]}], "
+            "\"new_terms\": [逐字稿中出現的專有名詞/產品名/英文縮寫/領域術語，"
+            "尚未在既有詞彙表 %s 中的，最多5個，沒有給空陣列；"
+            "只收真實出現且拼寫可信的詞，不確定的不要收]"
+        ) % (transcript_text,
+             json.dumps(known_terms, ensure_ascii=False) if known_terms else "[]")
 
         if questions:
             prompt += ', "question_findings": {'
@@ -676,9 +741,13 @@ class MeetingMonitor:
 
         analysis = self._parse_json(response)
         analysis["timestamp"] = time.time()
+        new_terms = analysis.pop("new_terms", None)
 
         with self._lock:
             self.analysis_history.append(analysis)
+
+        if new_terms:
+            self._merge_auto_terms(new_terms)
 
         self._notify_update()
         self._update_session_summary()
