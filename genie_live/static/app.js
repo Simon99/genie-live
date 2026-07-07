@@ -465,6 +465,9 @@
           ${captureError
             ? html`<div class="error-banner">錄製失敗：${captureError}</div>`
             : null}
+          ${capture.auto_stopped && !recording
+            ? html`<div class="warn-banner">${capture.auto_stopped}</div>`
+            : null}
           ${this.state.uiError
             ? html`<div class="error-banner">${this.state.uiError}</div>`
             : null}

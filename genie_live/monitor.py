@@ -112,6 +112,7 @@ class MeetingMonitor:
         slow_model: str = "medium",
         slow_window: int = 30,
         vocab_path: str = None,
+        auto_stop_minutes: float = 10.0,
     ):
         self.llm = LMStudioClient(base_url=lm_studio_url, model=text_model)
         self.questions = list(questions or [])
@@ -170,6 +171,15 @@ class MeetingMonitor:
         self._session_timeline = []
         self._summary_upto_time = 0.0
 
+        # Auto-stop: when every chunk has been gate-silent for this long,
+        # nobody is talking (meeting over, app closed) — fire idle
+        # callbacks once so the server can stop the capture instead of
+        # transcribing room tone forever.
+        self.auto_stop_minutes = auto_stop_minutes
+        self._idle_callbacks = []
+        self._last_active = time.monotonic()
+        self._idle_fired = False
+
         # Incremented by reset(); worker drops tasks from older generations.
         self._generation = 0
 
@@ -194,6 +204,10 @@ class MeetingMonitor:
     def on_update(self, callback):
         self._update_callbacks.append(callback)
 
+    def on_idle(self, callback):
+        """Register callback() fired once when sustained silence is detected."""
+        self._idle_callbacks.append(callback)
+
     def reset(self):
         """Clear all transcript segments, buffers and analysis.
 
@@ -211,6 +225,8 @@ class MeetingMonitor:
             self._gate_skipped = 0
             self._session_timeline = []
             self._summary_upto_time = 0.0
+            self._last_active = time.monotonic()
+            self._idle_fired = False
             # _peak_history is kept: the acoustic environment doesn't
             # change just because a new session started.
 
@@ -248,12 +264,28 @@ class MeetingMonitor:
                 batch = list(self._slow_buffer)
                 self._slow_buffer = []
 
+        now = time.monotonic()
+        fire_idle = False
         if silent:
             logger.info("gate: chunk %d silent (peak %.1f dB < %.1f dB), skipping fast pass",
                         chunk_index, peak_db, threshold)
+            if (not self._idle_fired and self.auto_stop_minutes
+                    and now - self._last_active > self.auto_stop_minutes * 60):
+                self._idle_fired = True
+                fire_idle = True
         else:
+            self._last_active = now
+            self._idle_fired = False
             self._queue.put(
-                ("fast", {"path": chunk_path, "offset": offset}, time.monotonic(), gen))
+                ("fast", {"path": chunk_path, "offset": offset}, now, gen))
+        if fire_idle:
+            logger.warning("no speech for %.0f minutes — firing idle callbacks",
+                           self.auto_stop_minutes)
+            for cb in self._idle_callbacks:
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("idle callback failed")
         if batch:
             if any(not c["silent"] for c in batch):
                 self._queue.put(("slow", batch, time.monotonic(), gen))
@@ -285,7 +317,13 @@ class MeetingMonitor:
         p20 = peaks[int(n * 0.2)]
         p80 = peaks[int(n * 0.8)]
         if p80 - p20 < 8.0:
-            return self._gate_abs_floor_db  # unimodal: only hard-floor gating
+            # Unimodal. A quiet unimodal stream (all peaks well below any
+            # plausible speech level) is a room with nobody talking — e.g.
+            # the meeting app was closed and the mic hears only room tone;
+            # whisper turns that into endless garbage. Gate the whole band.
+            if p80 < -28.0:
+                return min(p80 + 3.0, self._gate_auto_cap)
+            return self._gate_abs_floor_db  # loud unimodal: continuous speech
         return min(max(p20 + self._gate_auto_margin, self._gate_abs_floor_db),
                    p80 - 3.0, self._gate_auto_cap)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -34,13 +35,14 @@ def create_app(
     if monitor is None:
         monitor = MeetingMonitor(lm_studio_url=lm_studio_url, text_model=text_model)
 
-    captures = {"audio": None, "screen": None}
+    captures = {"audio": None, "screen": None, "auto_stopped": None}
 
     def _augment_state(state: dict) -> dict:
         audio = captures["audio"]
         state["capture"] = {
             "recording": bool(audio and audio.is_running()),
             "error": audio.error if audio else None,
+            "auto_stopped": captures["auto_stopped"],
         }
         return state
 
@@ -59,6 +61,23 @@ def create_app(
                     logger.exception("failed to stop %s capture", key)
                 captures[key] = None
 
+    def on_idle():
+        # Sustained silence (meeting ended / app closed): stop recording
+        # instead of transcribing room tone forever. Runs on the capture
+        # watcher thread — _stop_captures joins it, so stop via a helper
+        # thread and notify the UI when done.
+        def _do_stop():
+            logger.warning("auto-stopping capture after %.0f min without speech",
+                           monitor.auto_stop_minutes)
+            _stop_captures()
+            captures["auto_stopped"] = (
+                "偵測到連續 %d 分鐘無語音，已自動停止錄製"
+                % int(monitor.auto_stop_minutes))
+            socketio.emit("state_update", _augment_state(monitor.get_state()))
+        threading.Thread(target=_do_stop, daemon=True, name="auto-stop").start()
+
+    monitor.on_idle(on_idle)
+
     @app.route("/api/start", methods=["POST"])
     def start_monitoring():
         data = request.get_json(silent=True) or {}
@@ -66,6 +85,7 @@ def create_app(
         # A repeated /api/start must not leak the previous session's
         # capture threads or pollute the timeline: stop + reset first.
         _stop_captures()
+        captures["auto_stopped"] = None
         monitor.reset()
         monitor.set_questions(data.get("questions", []))
 

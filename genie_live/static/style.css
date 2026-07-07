@@ -235,3 +235,8 @@ ul.keypoints li { margin: 2px 0; }
 .tl-decisions { font-size: 13px; color: #5fd786; margin-top: 2px; }
 
 .chip-auto { border-style: dashed; border-color: #5a7bb0; background: #1c2740; }
+
+.warn-banner {
+  background: #3a2f14; color: #e8bf5a; border: 1px solid #77602a;
+  border-radius: 6px; padding: 8px 12px; margin: 8px 0;
+}
