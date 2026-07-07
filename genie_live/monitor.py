@@ -700,8 +700,14 @@ class MeetingMonitor:
             recent = list(self._merged_segments[-20:])
             questions = list(self.questions)
 
+        # Mark rough (fast-pass) lines: term extraction must ignore them —
+        # learning a garbled term poisons the hotword prompt, which then
+        # biases later transcription toward the garble (observed live:
+        # noise-hallucinated 電源器 became a hotword, then a topic title).
         transcript_text = "\n".join(
-            "[%02d:%02d] %s" % (int(s["start"] // 60), int(s["start"] % 60), s["text"])
+            "[%02d:%02d]%s %s" % (int(s["start"] // 60), int(s["start"] % 60),
+                                  "" if s.get("quality") == "refined" else "(粗)",
+                                  s["text"])
             for s in recent
         )
 
@@ -709,12 +715,14 @@ class MeetingMonitor:
             known_terms = self._vocab_terms + self._vocab_auto
 
         prompt = (
-            "You are monitoring a live meeting. Recent transcript:\n%s\n\n"
+            "You are monitoring a live meeting. Recent transcript "
+            "((粗) 標記 = 粗轉寫，內容不可靠):\n%s\n\n"
             "Provide JSON: {\"current_topic\": \"...\", \"status\": \"...\", "
             "\"key_points\": [...], \"disputes\": [{\"topic\": \"...\", \"positions\": [...]}], "
             "\"new_terms\": [逐字稿中出現的專有名詞/產品名/英文縮寫/領域術語，"
             "尚未在既有詞彙表 %s 中的，最多5個，沒有給空陣列；"
-            "只收真實出現且拼寫可信的詞，不確定的不要收]"
+            "只能取自沒有(粗)標記的行；只收真實出現、拼寫可信、且是通用或"
+            "領域正規用語的詞，看起來像轉寫錯誤的怪詞不要收]"
         ) % (transcript_text,
              json.dumps(known_terms, ensure_ascii=False) if known_terms else "[]")
 
