@@ -219,3 +219,17 @@ ul.keypoints li { margin: 2px 0; }
   cursor: pointer; font-size: 13px; padding: 0 2px;
 }
 .chip-x:hover { color: #ff7b72; }
+
+/* ---- session timeline ---- */
+.tl-block {
+  border-left: 3px solid #35507a;
+  padding: 4px 0 4px 10px;
+  margin: 8px 0;
+}
+.tl-block.tl-open { border-left-color: #ffb300; }
+.tl-time { font-size: 12px; color: #8ba3c7; font-family: monospace; }
+.tl-live {
+  margin-left: 6px; font-size: 11px; color: #ffb300;
+  border: 1px solid #77602a; border-radius: 8px; padding: 0 6px;
+}
+.tl-decisions { font-size: 13px; color: #5fd786; margin-top: 2px; }

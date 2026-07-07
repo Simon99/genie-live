@@ -111,6 +111,7 @@ class MeetingMonitor:
         fast_model: str = "small",
         slow_model: str = "medium",
         slow_window: int = 30,
+        vocab_path: str = None,
     ):
         self.llm = LMStudioClient(base_url=lm_studio_url, model=text_model)
         self.questions = list(questions or [])
@@ -152,12 +153,19 @@ class MeetingMonitor:
         # ASR vocabulary. Plain terms bias whisper decoding via
         # initial_prompt; "錯詞=正詞" entries additionally force a text
         # replacement after transcription (for stubborn homophones).
+        # Persisted to vocab_path so it survives restarts.
         self._vocab_raw = []              # entries as the user typed them
         self._vocab_terms = []            # plain hotword terms
         self._corrections = {}            # wrong -> right
+        self._vocab_path = Path(
+            vocab_path or Path.home() / ".genie" / "live_vocabulary.json")
+        self._load_vocabulary()
 
-        # Whole-session rolling summary (incrementally folded by the LLM).
-        self._session_summary = None
+        # Whole-session timeline summary: chronological blocks of
+        # {"start_sec","end_sec","topic","points","decisions"}. Only the
+        # last (open) block may be revised by later updates; earlier
+        # blocks are frozen, so cost stays bounded and content can't drift.
+        self._session_timeline = []
         self._summary_upto_time = 0.0
 
         # Incremented by reset(); worker drops tasks from older generations.
@@ -199,7 +207,7 @@ class MeetingMonitor:
             self.analysis_history = []
             self.screen_frames = []
             self._gate_skipped = 0
-            self._session_summary = None
+            self._session_timeline = []
             self._summary_upto_time = 0.0
             # _peak_history is kept: the acoustic environment doesn't
             # change just because a new session started.
@@ -295,6 +303,7 @@ class MeetingMonitor:
 
         Plain entries become whisper initial_prompt terms; entries written
         as ``錯詞=正詞`` also force a post-transcription replacement.
+        The list is persisted to ``vocab_path`` and reloaded on startup.
         """
         terms, corrections, raw = [], {}, []
         for e in entries or []:
@@ -314,7 +323,45 @@ class MeetingMonitor:
             self._vocab_raw = raw
             self._vocab_terms = terms
             self._corrections = corrections
+        self._save_vocabulary(raw)
         self._notify_update()
+
+    def _load_vocabulary(self):
+        """Load persisted vocabulary at startup (missing file is fine)."""
+        try:
+            if self._vocab_path.exists():
+                raw = json.loads(self._vocab_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list) and raw:
+                    # Re-run the parse without re-saving.
+                    terms, corrections, kept = [], {}, []
+                    for e in raw:
+                        e = str(e).strip()
+                        if not e:
+                            continue
+                        kept.append(e)
+                        if "=" in e:
+                            wrong, _, right = e.partition("=")
+                            wrong, right = wrong.strip(), right.strip()
+                            if wrong and right:
+                                corrections[wrong] = right
+                                terms.append(right)
+                            continue
+                        terms.append(e)
+                    self._vocab_raw = kept
+                    self._vocab_terms = terms
+                    self._corrections = corrections
+                    logger.info("loaded %d vocabulary entries from %s",
+                                len(kept), self._vocab_path)
+        except Exception:
+            logger.exception("failed to load vocabulary from %s", self._vocab_path)
+
+    def _save_vocabulary(self, raw: list):
+        try:
+            self._vocab_path.parent.mkdir(parents=True, exist_ok=True)
+            self._vocab_path.write_text(
+                json.dumps(raw, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:
+            logger.exception("failed to save vocabulary to %s", self._vocab_path)
 
     def _initial_prompt(self) -> str:
         """Hotword prompt for whisper, or None (hold self._lock)."""
@@ -375,7 +422,7 @@ class MeetingMonitor:
                 "recent_transcript": display,
                 "latest_analysis": self.analysis_history[-1] if self.analysis_history else None,
                 "questions": self._get_question_status(),
-                "session_summary": self._session_summary,
+                "session_timeline": list(self._session_timeline),
                 "vocabulary": list(self._vocab_raw),
                 "audio_gate": {
                     "mode": self.gate_mode,
@@ -635,18 +682,21 @@ class MeetingMonitor:
         self._update_session_summary()
 
     def _update_session_summary(self):
-        """Incrementally fold new transcript into the whole-session summary.
+        """Fold new transcript into the chronological timeline summary.
 
-        Runs on the worker thread after each analysis round. Feeds the LLM
-        the previous summary plus segments newer than the last folded
-        timestamp, so cost stays bounded regardless of meeting length.
+        Runs on the worker thread after each analysis round. The LLM sees
+        only the last (open) timeline block plus transcript newer than the
+        last folded timestamp; it may revise that block and/or append new
+        blocks. Earlier blocks are frozen — bounded cost, no drift.
         """
         with self._lock:
             new_segs = [s for s in self._merged_segments
                         if s["start"] >= self._summary_upto_time]
             if not new_segs:
                 return
-            prev = self._session_summary
+            frozen = self._session_timeline[:-1]
+            open_block = (self._session_timeline[-1]
+                          if self._session_timeline else None)
             upto = max(s["end"] for s in new_segs)
 
         new_text = "\n".join(
@@ -654,34 +704,38 @@ class MeetingMonitor:
             for s in new_segs
         )
         prompt = (
-            "你在維護一場進行中會議的「整場整理」。\n"
-            "目前為止的整理（JSON，可能為 null）：\n%s\n\n"
-            "新增逐字稿：\n%s\n\n"
-            "把新內容併入整理：同主題合併、保留所有決議與待辦、"
-            "不要遺失既有內容。輸出 JSON："
-            "{\"overview\": \"一段話總覽\", "
-            "\"topics\": [{\"title\": \"...\", \"points\": [\"...\"]}], "
-            "\"decisions\": [\"...\"], \"action_items\": [\"...\"]}"
-        ) % (json.dumps(prev, ensure_ascii=False), new_text)
+            "你在維護一場進行中會議的「時間軸整理」：按時間順序，"
+            "每個時間段一個議題區塊。\n"
+            "目前進行中的區塊（可修改；null 表示還沒有）：\n%s\n\n"
+            "新增逐字稿（時間戳為 分:秒）：\n%s\n\n"
+            "規則：新內容若延續同一議題，就更新進行中的區塊（擴充 points、"
+            "延長 end_sec）；若話題已切換，結束該區塊並開新區塊；"
+            "一次可回傳多個區塊。點列要具體，含結論與數據。\n"
+            "輸出 JSON：{\"blocks\": [{\"start_sec\": 秒數, \"end_sec\": 秒數, "
+            "\"topic\": \"...\", \"points\": [\"...\"], \"decisions\": [\"...\"]}]}"
+            "（blocks[0] 是進行中區塊的更新版，其後為新區塊）"
+        ) % (json.dumps(open_block, ensure_ascii=False), new_text)
 
         try:
             response = self.llm.complete(
                 prompt=prompt,
-                system="Meeting summarizer. Output ONLY valid JSON. "
+                system="Meeting timeline summarizer. Output ONLY valid JSON. "
                        + self.ANALYSIS_STYLE,
                 temperature=0.2,
             )
-            summary = self._parse_json(response)
+            result = self._parse_json(response)
         except Exception:
-            logger.exception("session summary update failed")
+            logger.exception("session timeline update failed")
             return
 
-        if not isinstance(summary, dict) or "overview" not in summary:
-            logger.warning("session summary response malformed, keeping previous")
+        blocks = result.get("blocks") if isinstance(result, dict) else None
+        if not isinstance(blocks, list) or not all(
+                isinstance(b, dict) and "topic" in b for b in blocks):
+            logger.warning("timeline response malformed, keeping previous")
             return
 
         with self._lock:
-            self._session_summary = summary
+            self._session_timeline = frozen + blocks
             self._summary_upto_time = upto
 
         self._notify_update()

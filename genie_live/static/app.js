@@ -192,38 +192,34 @@
       </div>`;
   }
 
-  /* ---------------- session summary ---------------- */
+  /* ---------------- session timeline ---------------- */
 
-  function SessionSummaryPanel(props) {
-    var s = (props.serverState || {}).session_summary;
+  function SessionTimelinePanel(props) {
+    var blocks = (props.serverState || {}).session_timeline || [];
     return html`
       <div class="panel">
-        <h3>整場整理</h3>
-        ${!s
+        <h3>整場整理（時間軸）</h3>
+        ${blocks.length === 0
           ? html`<div class="muted">（累積整理中，錄到內容後出現）</div>`
-          : html`
-            <p class="topic">${s.overview}</p>
-            ${(s.topics || []).map(function (t, i) {
+          : blocks.map(function (b, i) {
+              var open = i === blocks.length - 1;
               return html`
-                <div class="sum-topic" key=${i}>
-                  <div class="sum-title">${t.title}</div>
-                  <ul>${(t.points || []).map(function (p, j) {
+                <div class="tl-block ${open ? "tl-open" : ""}" key=${i}>
+                  <div class="tl-time">
+                    ${fmtTime(b.start_sec || 0)} – ${fmtTime(b.end_sec || 0)}
+                    ${open ? html`<span class="tl-live">進行中</span>` : null}
+                  </div>
+                  <div class="sum-title">${b.topic}</div>
+                  <ul>${(b.points || []).map(function (p, j) {
                     return html`<li key=${j}>${String(p)}</li>`;
                   })}</ul>
+                  ${(b.decisions || []).length
+                    ? html`<div class="tl-decisions">決議：
+                        ${b.decisions.map(function (d) { return String(d); }).join("；")}
+                      </div>`
+                    : null}
                 </div>`;
             })}
-            ${(s.decisions || []).length
-              ? html`<div class="sum-title">決議</div>
-                  <ul>${s.decisions.map(function (d, i) {
-                    return html`<li key=${i}>${String(d)}</li>`;
-                  })}</ul>`
-              : null}
-            ${(s.action_items || []).length
-              ? html`<div class="sum-title">待辦</div>
-                  <ul>${s.action_items.map(function (d, i) {
-                    return html`<li key=${i}>${String(d)}</li>`;
-                  })}</ul>`
-              : null}`}
       </div>`;
   }
 
@@ -468,7 +464,7 @@
             </div>
             <div>
               <${AnalysisPanel} serverState=${this.state.serverState} />
-              <${SessionSummaryPanel} serverState=${this.state.serverState} />
+              <${SessionTimelinePanel} serverState=${this.state.serverState} />
               <${VocabPanel}
                 serverState=${this.state.serverState}
                 onSetVocabulary=${function (list) {
