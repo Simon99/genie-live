@@ -4,17 +4,84 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
+import re
 import subprocess
 import tempfile
 import time
 import threading
+import wave
+from collections import deque
 from pathlib import Path
 
 from genie_core.audio import transcribe_audio
 from genie_core.llm import LMStudioClient
 
 logger = logging.getLogger(__name__)
+
+
+def _chunk_peak_db(path: str) -> float:
+    """Peak level of a 16-bit PCM wav in dBFS (0 = full scale).
+
+    Returns None when the file can't be analyzed (unexpected format) so
+    callers treat the chunk as audible rather than silently dropping it.
+    """
+    try:
+        with wave.open(path, "rb") as w:
+            if w.getsampwidth() != 2:
+                return None
+            peak = 0
+            while True:
+                frames = w.readframes(65536)
+                if not frames:
+                    break
+                mv = memoryview(frames).cast("h")
+                for sample in mv:
+                    a = -sample if sample < 0 else sample
+                    if a > peak:
+                        peak = a
+            if peak == 0:
+                return -96.0
+            return 20.0 * math.log10(peak / 32768.0)
+    except Exception:
+        logger.exception("peak analysis failed for %s", path)
+        return None
+
+
+def _collapse_inline_repeats(text: str) -> str:
+    """Collapse whisper's in-segment hallucination loops.
+
+    A single segment can contain the same phrase looped many times
+    (observed live: 「我们将在最后的一段时间中,」×7 inside one 27s
+    segment). A phrase of 4+ chars repeated 3+ times back-to-back is
+    almost never real speech — keep one occurrence.
+    """
+    if len(text) < 16:
+        return text
+    return re.sub(r"(.{4,60}?)(?:\1){2,}", r"\1", text)
+
+
+def _append_collapsed(target: list, segments: list, offset: float, quality: str):
+    """Append transcribed segments, collapsing consecutive duplicate text.
+
+    Whisper hallucination on noise repeats the same sentence in a tight
+    loop ("測試一下" x10); collapsing keeps one entry and extends its end
+    time. Only adjacent (< 4s gap) identical texts are merged, so a phrase
+    genuinely said again later still gets its own segment.
+    """
+    for seg in segments:
+        seg["text"] = _collapse_inline_repeats(seg["text"])
+        text = seg["text"].strip()
+        start = seg["start"] + offset
+        end = seg["end"] + offset
+        last = target[-1] if target else None
+        if (last is not None and last["text"].strip() == text
+                and start - last["end"] < 4.0):
+            last["end"] = max(last["end"], end)
+            continue
+        target.append({"start": start, "end": end, "text": seg["text"],
+                       "quality": quality})
 
 
 class MeetingMonitor:
@@ -30,9 +97,10 @@ class MeetingMonitor:
       (``slow_model``, default "medium"); the refined result replaces the
       fast segments it covers.
 
-    All whisper work is serialized on a single worker thread — the MLX
-    whisper backend must never be called concurrently. LLM analysis tasks
-    also run on the worker so callers (HTTP handlers) never block.
+    All whisper work is serialized on the ASR worker thread — the MLX
+    whisper backend must never be called concurrently. LLM analysis and
+    summary calls run on a separate LLM worker (with request coalescing)
+    so slow LLM inference never starves transcription.
     """
 
     def __init__(
@@ -66,14 +134,48 @@ class MeetingMonitor:
         # Slow window accumulation ({"path","index","offset","chunk_seconds"})
         self._slow_buffer = []
 
+        # Silence gate. Whisper hallucinates fluent text on silence/noise,
+        # so chunks whose peak is below the gate threshold skip transcription.
+        # "auto" derives the threshold from the observed noise floor (20th
+        # percentile of recent chunk peaks + margin) because the floor is
+        # highly environment-dependent (measured: WeMeet loopback ~-23 dB
+        # peak vs real speech ~-14 dB peak).
+        self.gate_mode = "auto"           # "auto" | "manual" | "off"
+        self.gate_manual_db = -20.0
+        self._peak_history = deque(maxlen=90)
+        self._last_peak_db = None
+        self._gate_skipped = 0
+        self._gate_auto_margin = 6.0
+        self._gate_auto_cap = -12.0       # never gate louder chunks than this
+        self._gate_abs_floor_db = -55.0   # below this is silence, always
+
+        # ASR vocabulary. Plain terms bias whisper decoding via
+        # initial_prompt; "錯詞=正詞" entries additionally force a text
+        # replacement after transcription (for stubborn homophones).
+        self._vocab_raw = []              # entries as the user typed them
+        self._vocab_terms = []            # plain hotword terms
+        self._corrections = {}            # wrong -> right
+
+        # Whole-session rolling summary (incrementally folded by the LLM).
+        self._session_summary = None
+        self._summary_upto_time = 0.0
+
         # Incremented by reset(); worker drops tasks from older generations.
         self._generation = 0
 
-        # Single worker serializes all whisper + LLM work.
+        # Two workers: the ASR queue serializes whisper work (the MLX
+        # backend must never run concurrently); the LLM queue runs
+        # analysis/summary calls, which can take tens of seconds each and
+        # must never block transcription (observed live: analysis on the
+        # shared worker backlogged fast tasks by 700s).
         self._queue = queue.Queue()
         self._worker = threading.Thread(
-            target=self._worker_loop, daemon=True, name="monitor-worker")
+            target=self._worker_loop, daemon=True, name="monitor-asr-worker")
         self._worker.start()
+        self._llm_queue = queue.Queue()
+        self._llm_worker = threading.Thread(
+            target=self._llm_worker_loop, daemon=True, name="monitor-llm-worker")
+        self._llm_worker.start()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -96,22 +198,39 @@ class MeetingMonitor:
             self._slow_buffer = []
             self.analysis_history = []
             self.screen_frames = []
+            self._gate_skipped = 0
+            self._session_summary = None
+            self._summary_upto_time = 0.0
+            # _peak_history is kept: the acoustic environment doesn't
+            # change just because a new session started.
 
     def add_audio_chunk(self, chunk_path: str, chunk_index: int, chunk_seconds: int):
         """Queue a new audio chunk for dual-window processing.
 
         Non-blocking: enqueues a fast-pass task immediately and, when
         ``slow_window`` seconds have accumulated, a slow-pass task.
+        Chunks below the silence-gate threshold skip the fast pass; a slow
+        batch is skipped only when every chunk in it was silent.
         """
         offset = chunk_index * chunk_seconds
+        peak_db = _chunk_peak_db(chunk_path)
 
         with self._lock:
             gen = self._generation
+            self._last_peak_db = peak_db
+            if peak_db is not None:
+                self._peak_history.append(peak_db)
+            threshold = self._gate_threshold()
+            silent = (peak_db is not None and threshold is not None
+                      and peak_db < threshold)
+            if silent:
+                self._gate_skipped += 1
             self._slow_buffer.append({
                 "path": chunk_path,
                 "index": chunk_index,
                 "offset": offset,
                 "chunk_seconds": chunk_seconds,
+                "silent": silent,
             })
             accumulated = sum(c["chunk_seconds"] for c in self._slow_buffer)
             batch = None
@@ -119,10 +238,100 @@ class MeetingMonitor:
                 batch = list(self._slow_buffer)
                 self._slow_buffer = []
 
-        self._queue.put(
-            ("fast", {"path": chunk_path, "offset": offset}, time.monotonic(), gen))
+        if silent:
+            logger.info("gate: chunk %d silent (peak %.1f dB < %.1f dB), skipping fast pass",
+                        chunk_index, peak_db, threshold)
+        else:
+            self._queue.put(
+                ("fast", {"path": chunk_path, "offset": offset}, time.monotonic(), gen))
         if batch:
-            self._queue.put(("slow", batch, time.monotonic(), gen))
+            if any(not c["silent"] for c in batch):
+                self._queue.put(("slow", batch, time.monotonic(), gen))
+            else:
+                logger.info("gate: slow batch %s all silent, skipped",
+                            [c["index"] for c in batch])
+
+    def _gate_threshold(self) -> float:
+        """Active gate threshold in dBFS, or None to disable (hold lock).
+
+        Auto mode gates only when the recent peak distribution is clearly
+        bimodal (a quiet cluster well below a loud cluster). In a
+        continuous-audio environment every chunk is loud-ish; a naive
+        percentile floor then drifts up and gates real speech (observed
+        live: threshold hit the cap and skipped -16 dB speech chunks).
+        """
+        if self.gate_mode == "off":
+            return None
+        if self.gate_mode == "manual":
+            return self.gate_manual_db
+        # Absolute floor: peaks this low are digital/near silence no matter
+        # what the distribution looks like (observed live: an all-silent
+        # meeting is unimodal, which disabled the bimodal gate and whisper
+        # hallucinated on -91 dB zeros for minutes).
+        peaks = sorted(self._peak_history)
+        n = len(peaks)
+        if n < 12:
+            return self._gate_abs_floor_db
+        p20 = peaks[int(n * 0.2)]
+        p80 = peaks[int(n * 0.8)]
+        if p80 - p20 < 8.0:
+            return self._gate_abs_floor_db  # unimodal: only hard-floor gating
+        return min(max(p20 + self._gate_auto_margin, self._gate_abs_floor_db),
+                   p80 - 3.0, self._gate_auto_cap)
+
+    def set_gate(self, mode: str = None, threshold_db: float = None):
+        """Update silence-gate settings from the UI."""
+        with self._lock:
+            if mode is not None:
+                if mode not in ("auto", "manual", "off"):
+                    raise ValueError("gate mode must be auto/manual/off")
+                self.gate_mode = mode
+            if threshold_db is not None:
+                self.gate_manual_db = max(-96.0, min(0.0, float(threshold_db)))
+        self._notify_update()
+
+    def set_vocabulary(self, entries: list):
+        """Update the ASR hotword list from the UI (hot, no restart).
+
+        Plain entries become whisper initial_prompt terms; entries written
+        as ``錯詞=正詞`` also force a post-transcription replacement.
+        """
+        terms, corrections, raw = [], {}, []
+        for e in entries or []:
+            e = str(e).strip()
+            if not e:
+                continue
+            raw.append(e)
+            if "=" in e:
+                wrong, _, right = e.partition("=")
+                wrong, right = wrong.strip(), right.strip()
+                if wrong and right:
+                    corrections[wrong] = right
+                    terms.append(right)
+                continue
+            terms.append(e)
+        with self._lock:
+            self._vocab_raw = raw
+            self._vocab_terms = terms
+            self._corrections = corrections
+        self._notify_update()
+
+    def _initial_prompt(self) -> str:
+        """Hotword prompt for whisper, or None (hold self._lock)."""
+        if not self._vocab_terms:
+            return None
+        return "會議詞彙：" + "、".join(self._vocab_terms)
+
+    def _apply_corrections(self, segments: list) -> list:
+        with self._lock:
+            corrections = dict(self._corrections)
+        if not corrections:
+            return segments
+        for seg in segments:
+            for wrong, right in corrections.items():
+                if wrong in seg["text"]:
+                    seg["text"] = seg["text"].replace(wrong, right)
+        return segments
 
     def add_screen_frame(self, frame_path: str, index: int, timestamp: float):
         with self._lock:
@@ -140,7 +349,12 @@ class MeetingMonitor:
         with self._lock:
             self.questions = list(questions or [])
             gen = self._generation
-        self._queue.put(("analyze", None, time.monotonic(), gen))
+        self._request_analysis(gen)
+
+    def get_full_transcript(self) -> list:
+        """Complete merged transcript (refined + uncovered fast tail)."""
+        with self._lock:
+            return [dict(s) for s in self._merged_segments]
 
     def get_state(self) -> dict:
         with self._lock:
@@ -152,6 +366,7 @@ class MeetingMonitor:
                 "quality": s.get("quality", "fast"),
             } for s in recent]
 
+            threshold = self._gate_threshold()
             return {
                 "transcript_count": len(self._merged_segments),
                 "fast_count": len(self._fast_segments),
@@ -160,6 +375,18 @@ class MeetingMonitor:
                 "recent_transcript": display,
                 "latest_analysis": self.analysis_history[-1] if self.analysis_history else None,
                 "questions": self._get_question_status(),
+                "session_summary": self._session_summary,
+                "vocabulary": list(self._vocab_raw),
+                "audio_gate": {
+                    "mode": self.gate_mode,
+                    "threshold_db": threshold,
+                    "manual_db": self.gate_manual_db,
+                    "last_peak_db": self._last_peak_db,
+                    "noise_floor_db": (sorted(self._peak_history)[
+                        max(0, int(len(self._peak_history) * 0.2) - 1)]
+                        if len(self._peak_history) >= 6 else None),
+                    "skipped_chunks": self._gate_skipped,
+                },
             }
 
     # ------------------------------------------------------------------ #
@@ -186,20 +413,55 @@ class MeetingMonitor:
                     self._fast_pass(payload["path"], payload["offset"], gen)
                 elif kind == "slow":
                     self._slow_pass(payload, gen)
-                elif kind == "analyze":
-                    self._analyze_current_state()
             except Exception:
                 logger.exception("worker task %r failed", kind)
             finally:
                 self._queue.task_done()
 
+    def _request_analysis(self, gen: int = None):
+        if gen is None:
+            with self._lock:
+                gen = self._generation
+        self._llm_queue.put(("analyze", None, time.monotonic(), gen))
+
+    def _llm_worker_loop(self):
+        while True:
+            kind, payload, enqueued_at, gen = self._llm_queue.get()
+            # Coalesce: analysis always looks at the *current* transcript,
+            # so a backlog of pending requests collapses into one run.
+            drained = 0
+            try:
+                while True:
+                    k2, _, _, g2 = self._llm_queue.get_nowait()
+                    self._llm_queue.task_done()
+                    drained += 1
+                    gen = g2
+            except queue.Empty:
+                pass
+            if drained:
+                logger.info("coalesced %d pending analysis requests", drained)
+            try:
+                with self._lock:
+                    if gen != self._generation:
+                        continue
+                if kind == "analyze":
+                    self._analyze_current_state()
+            except Exception:
+                logger.exception("llm worker task %r failed", kind)
+            finally:
+                self._llm_queue.task_done()
+
     def _fast_pass(self, chunk_path: str, offset: float, gen: int):
         """Quick transcription of a single short chunk (small model)."""
         try:
+            with self._lock:
+                prompt = self._initial_prompt()
             segments = transcribe_audio(
                 chunk_path, language="zh",
                 model=self.fast_model, backend="mlx",
+                initial_prompt=prompt,
             )
+            segments = self._apply_corrections(segments)
         except Exception:
             logger.exception("fast pass failed for %s", chunk_path)
             return
@@ -207,13 +469,7 @@ class MeetingMonitor:
         with self._lock:
             if gen != self._generation:
                 return
-            for seg in segments:
-                self._fast_segments.append({
-                    "start": seg["start"] + offset,
-                    "end": seg["end"] + offset,
-                    "text": seg["text"],
-                    "quality": "fast",
-                })
+            _append_collapsed(self._fast_segments, segments, offset, "fast")
             self._merge_segments()
 
         self._notify_update()
@@ -233,13 +489,13 @@ class MeetingMonitor:
                 [c["index"] for c in chunk_infos])
             for info in chunk_infos:
                 self._refine_one(info["path"], info["offset"], gen)
-            self._analyze_current_state()
+            self._request_analysis(gen)
             return
 
         if len(chunk_infos) == 1:
             # Single chunk: no concat, no temp file needed.
             self._refine_one(chunk_infos[0]["path"], chunk_infos[0]["offset"], gen)
-            self._analyze_current_state()
+            self._request_analysis(gen)
             return
 
         combined_path = None
@@ -274,15 +530,19 @@ class MeetingMonitor:
             if combined_path:
                 Path(combined_path).unlink(missing_ok=True)
 
-        self._analyze_current_state()
+        self._request_analysis(gen)
 
     def _refine_one(self, audio_path: str, base_offset: float, gen: int):
         """Transcribe one audio file with the slow model and merge results."""
         try:
+            with self._lock:
+                prompt = self._initial_prompt()
             segments = transcribe_audio(
                 audio_path, language="zh",
                 model=self.slow_model, backend="mlx",
+                initial_prompt=prompt,
             )
+            segments = self._apply_corrections(segments)
         except Exception:
             logger.exception("refined transcription failed for %s", audio_path)
             return
@@ -290,13 +550,7 @@ class MeetingMonitor:
         with self._lock:
             if gen != self._generation:
                 return
-            for seg in segments:
-                self._slow_segments.append({
-                    "start": seg["start"] + base_offset,
-                    "end": seg["end"] + base_offset,
-                    "text": seg["text"],
-                    "quality": "refined",
-                })
+            _append_collapsed(self._slow_segments, segments, base_offset, "refined")
             self._merge_segments()
 
         self._notify_update()
@@ -326,6 +580,11 @@ class MeetingMonitor:
         merged = list(self._slow_segments) + kept_fast
         merged.sort(key=lambda s: s["start"])
         self._merged_segments = merged
+
+    ANALYSIS_STYLE = (
+        "所有描述用繁體中文；技術術語、產品名、API 名保留英文原文"
+        "（例如「用 initial_prompt 做 hotword biasing」）。"
+    )
 
     def _analyze_current_state(self):
         with self._lock:
@@ -358,7 +617,8 @@ class MeetingMonitor:
         try:
             response = self.llm.complete(
                 prompt=prompt,
-                system="Real-time meeting analyst. Output ONLY valid JSON. Be concise.",
+                system="Real-time meeting analyst. Output ONLY valid JSON. "
+                       "Be concise. " + self.ANALYSIS_STYLE,
                 temperature=0.2,
             )
         except Exception:
@@ -370,6 +630,59 @@ class MeetingMonitor:
 
         with self._lock:
             self.analysis_history.append(analysis)
+
+        self._notify_update()
+        self._update_session_summary()
+
+    def _update_session_summary(self):
+        """Incrementally fold new transcript into the whole-session summary.
+
+        Runs on the worker thread after each analysis round. Feeds the LLM
+        the previous summary plus segments newer than the last folded
+        timestamp, so cost stays bounded regardless of meeting length.
+        """
+        with self._lock:
+            new_segs = [s for s in self._merged_segments
+                        if s["start"] >= self._summary_upto_time]
+            if not new_segs:
+                return
+            prev = self._session_summary
+            upto = max(s["end"] for s in new_segs)
+
+        new_text = "\n".join(
+            "[%02d:%02d] %s" % (int(s["start"] // 60), int(s["start"] % 60), s["text"])
+            for s in new_segs
+        )
+        prompt = (
+            "你在維護一場進行中會議的「整場整理」。\n"
+            "目前為止的整理（JSON，可能為 null）：\n%s\n\n"
+            "新增逐字稿：\n%s\n\n"
+            "把新內容併入整理：同主題合併、保留所有決議與待辦、"
+            "不要遺失既有內容。輸出 JSON："
+            "{\"overview\": \"一段話總覽\", "
+            "\"topics\": [{\"title\": \"...\", \"points\": [\"...\"]}], "
+            "\"decisions\": [\"...\"], \"action_items\": [\"...\"]}"
+        ) % (json.dumps(prev, ensure_ascii=False), new_text)
+
+        try:
+            response = self.llm.complete(
+                prompt=prompt,
+                system="Meeting summarizer. Output ONLY valid JSON. "
+                       + self.ANALYSIS_STYLE,
+                temperature=0.2,
+            )
+            summary = self._parse_json(response)
+        except Exception:
+            logger.exception("session summary update failed")
+            return
+
+        if not isinstance(summary, dict) or "overview" not in summary:
+            logger.warning("session summary response malformed, keeping previous")
+            return
+
+        with self._lock:
+            self._session_summary = summary
+            self._summary_upto_time = upto
 
         self._notify_update()
 

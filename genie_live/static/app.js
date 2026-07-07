@@ -144,6 +144,139 @@
       </div>`;
   }
 
+  /* ---------------- audio gate ---------------- */
+
+  function GatePanel(props) {
+    var g = (props.serverState || {}).audio_gate;
+    if (!g) return null;
+    var peak = typeof g.last_peak_db === "number" ? g.last_peak_db : null;
+    var thr = typeof g.threshold_db === "number" ? g.threshold_db : null;
+    // map dB range [-60, 0] onto 0..100%
+    function pct(db) { return Math.max(0, Math.min(100, (db + 60) / 60 * 100)); }
+    var gated = peak !== null && thr !== null && peak < thr;
+    return html`
+      <div class="panel">
+        <h3>靜音閘門</h3>
+        <div class="meter">
+          <div class="meter-fill ${gated ? "meter-quiet" : "meter-live"}"
+               style="width:${peak === null ? 0 : pct(peak)}%"></div>
+          ${thr !== null
+            ? html`<div class="meter-thr" style="left:${pct(thr)}%"></div>`
+            : null}
+        </div>
+        <div class="gate-stats">
+          <span>峰值 ${peak === null ? "—" : peak.toFixed(1) + " dB"}</span>
+          <span>閾值 ${thr !== null ? thr.toFixed(1) + " dB"
+            : (g.mode === "auto" ? "未閘控（樣本不足或環境無法區分）" : "—")}</span>
+          <span>底噪 ${typeof g.noise_floor_db === "number" ? g.noise_floor_db.toFixed(1) + " dB" : "—"}</span>
+          <span>已跳過 ${g.skipped_chunks} 段</span>
+        </div>
+        <div class="gate-controls">
+          ${["auto", "manual", "off"].map(function (m) {
+            var label = m === "auto" ? "自動" : (m === "manual" ? "手動" : "關閉");
+            return html`
+              <button class="mini ${g.mode === m ? "active" : ""}" key=${m}
+                onClick=${function () { props.onSetGate({ mode: m }); }}>
+                ${label}</button>`;
+          })}
+          ${g.mode === "manual"
+            ? html`
+              <input type="range" min="-60" max="-5" step="1"
+                value=${g.manual_db}
+                onChange=${function (e) {
+                  props.onSetGate({ threshold_db: parseFloat(e.target.value) });
+                }} />
+              <span>${g.manual_db} dB</span>`
+            : null}
+        </div>
+      </div>`;
+  }
+
+  /* ---------------- session summary ---------------- */
+
+  function SessionSummaryPanel(props) {
+    var s = (props.serverState || {}).session_summary;
+    return html`
+      <div class="panel">
+        <h3>整場整理</h3>
+        ${!s
+          ? html`<div class="muted">（累積整理中，錄到內容後出現）</div>`
+          : html`
+            <p class="topic">${s.overview}</p>
+            ${(s.topics || []).map(function (t, i) {
+              return html`
+                <div class="sum-topic" key=${i}>
+                  <div class="sum-title">${t.title}</div>
+                  <ul>${(t.points || []).map(function (p, j) {
+                    return html`<li key=${j}>${String(p)}</li>`;
+                  })}</ul>
+                </div>`;
+            })}
+            ${(s.decisions || []).length
+              ? html`<div class="sum-title">決議</div>
+                  <ul>${s.decisions.map(function (d, i) {
+                    return html`<li key=${i}>${String(d)}</li>`;
+                  })}</ul>`
+              : null}
+            ${(s.action_items || []).length
+              ? html`<div class="sum-title">待辦</div>
+                  <ul>${s.action_items.map(function (d, i) {
+                    return html`<li key=${i}>${String(d)}</li>`;
+                  })}</ul>`
+              : null}`}
+      </div>`;
+  }
+
+  /* ---------------- vocabulary ---------------- */
+
+  var VocabPanel = (function () {
+    function VocabPanel() {
+      Component.apply(this, arguments);
+      this.state = { draft: "" };
+    }
+    VocabPanel.prototype = Object.create(Component.prototype);
+
+    VocabPanel.prototype.render = function (props) {
+      var self = this;
+      var vocab = (props.serverState || {}).vocabulary || [];
+
+      function add() {
+        var t = self.state.draft.trim();
+        if (!t || vocab.indexOf(t) !== -1) return;
+        self.setState({ draft: "" });
+        props.onSetVocabulary(vocab.concat([t]));
+      }
+      function remove(term) {
+        props.onSetVocabulary(vocab.filter(function (t) { return t !== term; }));
+      }
+
+      return html`
+        <div class="panel">
+          <h3>ASR 詞彙表</h3>
+          <div class="qadd">
+            <input type="text"
+              placeholder="專有名詞；「錯詞=正詞」可強制取代…"
+              value=${this.state.draft}
+              onInput=${function (e) { self.setState({ draft: e.target.value }); }}
+              onKeyDown=${function (e) { if (e.key === "Enter") add(); }} />
+            <button class="secondary" onClick=${add}>新增</button>
+          </div>
+          ${vocab.length === 0
+            ? html`<div class="muted">加入領域詞彙可提高轉寫命中率（即時生效）。</div>`
+            : html`<div class="vocab-chips">
+                ${vocab.map(function (t, i) {
+                  return html`
+                    <span class="chip" key=${i}>${t}
+                      <button class="chip-x"
+                        onClick=${function () { remove(t); }}>×</button>
+                    </span>`;
+                })}
+              </div>`}
+        </div>`;
+    };
+    return VocabPanel;
+  })();
+
   /* ---------------- questions ---------------- */
 
   var QuestionsPanel = (function () {
@@ -335,6 +468,19 @@
             </div>
             <div>
               <${AnalysisPanel} serverState=${this.state.serverState} />
+              <${SessionSummaryPanel} serverState=${this.state.serverState} />
+              <${VocabPanel}
+                serverState=${this.state.serverState}
+                onSetVocabulary=${function (list) {
+                  self.action(function () {
+                    return postJSON("/api/vocabulary", { vocabulary: list });
+                  });
+                }} />
+              <${GatePanel}
+                serverState=${this.state.serverState}
+                onSetGate=${function (body) {
+                  self.action(function () { return postJSON("/api/gate", body); });
+                }} />
               <${DisputesPanel} serverState=${this.state.serverState} />
               <${QuestionsPanel}
                 serverState=${this.state.serverState}

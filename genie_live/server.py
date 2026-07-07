@@ -103,6 +103,28 @@ def create_app(
         monitor.set_questions(data.get("questions", []))
         return jsonify({"status": "updated"})
 
+    @app.route("/api/transcript")
+    def full_transcript():
+        return jsonify({"segments": monitor.get_full_transcript()})
+
+    @app.route("/api/vocabulary", methods=["POST"])
+    def update_vocabulary():
+        data = request.get_json(silent=True) or {}
+        monitor.set_vocabulary(data.get("vocabulary", []))
+        return jsonify({"status": "updated"})
+
+    @app.route("/api/gate", methods=["POST"])
+    def update_gate():
+        data = request.get_json(silent=True) or {}
+        try:
+            monitor.set_gate(
+                mode=data.get("mode"),
+                threshold_db=data.get("threshold_db"),
+            )
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"status": "updated"})
+
     @app.route("/")
     def index():
         return send_from_directory(str(STATIC_DIR), "index.html")

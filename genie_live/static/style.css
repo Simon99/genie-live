@@ -180,3 +180,42 @@ ul.keypoints li { margin: 2px 0; }
 .question .finding { font-size: 0.88em; color: #b9b9cc; margin-top: 4px; }
 
 .qadd { display: flex; gap: 8px; margin-bottom: 6px; }
+
+/* ---- silence gate panel ---- */
+.meter {
+  position: relative;
+  height: 14px;
+  background: #1a2030;
+  border-radius: 7px;
+  overflow: hidden;
+  margin: 6px 0 8px;
+}
+.meter-fill { height: 100%; transition: width 0.4s ease; }
+.meter-live { background: linear-gradient(90deg, #2e7d32, #8bc34a); }
+.meter-quiet { background: #4a5568; }
+.meter-thr {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: #ffb300;
+}
+.gate-stats {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  font-size: 12px; color: #9aa5b1; margin-bottom: 8px;
+}
+.gate-controls { display: flex; align-items: center; gap: 8px; }
+.gate-controls .mini.active { border-color: #ffb300; color: #ffb300; }
+.gate-controls input[type="range"] { flex: 1; }
+
+/* ---- session summary / vocab ---- */
+.sum-topic { margin: 8px 0; }
+.sum-title { font-weight: 600; color: #c8d2dc; margin: 8px 0 2px; }
+.vocab-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #223047; border: 1px solid #35507a;
+  border-radius: 12px; padding: 2px 8px; font-size: 12px;
+}
+.chip-x {
+  background: none; border: none; color: #8ba3c7;
+  cursor: pointer; font-size: 13px; padding: 0 2px;
+}
+.chip-x:hover { color: #ff7b72; }
